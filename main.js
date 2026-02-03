@@ -5,6 +5,31 @@
 
 /** --- CONFIGURATION START --- **/
 
+let profiles = [
+    {
+        // [REQUIRED] Security Credentials
+        // You must obtain these from your browser's Network tab (F12) after logging in.
+        cred: "YOUR_CRED_STRING_HERE", 
+        
+        // The script will automatically refresh this.
+        token: "", 
+        
+        // [REQUIRED] Game Profile Details
+        // 'skGameRole' format is usually: "Platform_UserID_Server" (e.g., "3_4760000000_2")
+        skGameRole: "YOUR_ROLE_ID_HERE", 
+        platform: "3",                                 // Platform ID (3 usually stands for Android/PC)
+        vName: "1.0.0",                                // Game Version
+        accountName: "Arknight: Endfield Account"      // Nickname for Discord notifications
+    }
+    // You can duplicate the block above to add multiple accounts.
+];
+
+// Discord Notification Settings
+const ENABLE_DISCORD_NOTIFY = true;
+const DISCORD_USER_ID = "";         // Paste your User ID here to get pinged on error (e.g., "123456789")
+const DISCORD_WEBHOOK_URL = "";     // (Required) Paste your Discord Webhook URL here
+
+/** --- CONFIGURATION END --- **/
 
 // API Endpoints
 const URLS = {
