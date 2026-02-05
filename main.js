@@ -1,271 +1,200 @@
-/** 
- * Get cred and skGameRole from inspect element and in Network tab, 
- * Collect the value in the POST header for "attendance" request 
-**/ 
+/*
+  Node.js version of SKPort Auto Check-in
+  - Expects Node 18+ (global fetch available). Use Dockerfile provided which uses node:18-alpine.
+  - Configuration is provided via .env. See .env.example for format.
+*/
 
-/** --- CONFIGURATION START --- **/
+"use strict"
+try {
+    require("dotenv").config()
+} catch (e) {
+    console.warn("dotenv not installed; proceeding using environment variables provided by Docker or the host environment")
+}
+const { createHmac, createHash } = require("crypto")
 
-let profiles = [
-    {
-        // [REQUIRED] Security Credentials
-        // You must obtain these from your browser's Network tab (F12) after logging in.
-        cred: "YOUR_CRED_STRING_HERE", 
-        
-        // The script will automatically refresh this.
-        token: "", 
-        
-        // [REQUIRED] Game Profile Details
-        // 'skGameRole' format is usually: "Platform_UserID_Server" (e.g., "3_4760000000_2")
-        skGameRole: "YOUR_ROLE_ID_HERE", 
-        platform: "3",                                 // Platform ID (3 usually stands for Android/PC)
-        vName: "1.0.0",                                // Game Version
-        accountName: "Arknight: Endfield Account"      // Nickname for Discord notifications
+// Environment / configuration
+const ENABLE_DISCORD_NOTIFY = (process.env.ENABLE_DISCORD_NOTIFY || "true") === "true"
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || ""
+const DISCORD_USER_ID = process.env.DISCORD_USER_ID || ""
+const RUN_ONCE = (process.env.RUN_ONCE || "false") === "true"
+
+// PROFILES must be a JSON array string in the env. Example in .env.example
+let profiles = []
+if (process.env.PROFILES) {
+    try {
+        profiles = JSON.parse(process.env.PROFILES)
+        if (!Array.isArray(profiles)) throw new Error("PROFILES must be a JSON array")
+    } catch (err) {
+        console.error("Failed to parse PROFILES from .env:", err.message)
+        process.exit(1)
     }
-    // You can duplicate the block above to add multiple accounts.
-];
+} else {
+    console.error("PROFILES not set in .env. See .env.example")
+    process.exit(1)
+}
 
-// Discord Notification Settings
-const ENABLE_DISCORD_NOTIFY = true;
-const DISCORD_USER_ID = "";         // Paste your User ID here to get pinged on error (e.g., "123456789")
-const DISCORD_WEBHOOK_URL = "";     // (Required) Paste your Discord Webhook URL here
-
-/** --- CONFIGURATION END --- **/
-
-// API Endpoints
 const URLS = {
-    refresh: 'https://zonai.skport.com/web/v1/auth/refresh',
-    attendance: 'https://zonai.skport.com/web/v1/game/endfield/attendance'
-};
-
-async function main() {
-    let results = [];
-
-    // Process each profile sequentially
-    for (let i = 0; i < profiles.length; i++) {
-        let profile = profiles[i];
-
-        console.log(`[${profile.accountName}] Checking credentials and performing check-in...`);
-        
-        try {
-            // 1. Attempt to refresh the Token
-            // This ensures we have a valid key for signing the request and bypasses login CAPTCHA.
-            const newToken = refreshToken(profile);
-            
-
-            profile.token = newToken;
-            console.log(`[${profile.accountName}] Token refreshed successfully.`);
-            
-            // 2. Perform Check-in
-            let claimResult = autoClaimFunction(profile);
-            results.push(claimResult);
-
-        } catch (e) {
-            console.error(`[${profile.accountName}] Error: ${e.message}`);
-            results.push({
-                name: profile.accountName,
-                success: false,
-                status: "⛔ Auth/Refresh Failed",
-                rewards: "Please update your 'cred': " + e.message
-            });
-        }
-        
-        // Sleep for 1 second to avoid rate limiting
-        Utilities.sleep(1000); 
-    }
-    
-    if (ENABLE_DISCORD_NOTIFY && DISCORD_WEBHOOK_URL) {
-        sendDiscordEmbed(results);
-    }
+    refresh: "https://zonai.skport.com/web/v1/auth/refresh",
+    attendance: "https://zonai.skport.com/web/v1/game/endfield/attendance",
 }
 
-/**
- * Exchanges the existing 'cred' for a new 'token'.
- * This is the key to maintaining a persistent session without manual login.
- */
-function refreshToken(profile) {
-    const { cred, platform, vName } = profile;
-    
-    const header = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'cred': cred, 
-        'platform': platform,
-        'vName': vName,
-        'Origin': 'https://game.skport.com',
-        'Referer': 'https://game.skport.com/'
-    };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-    const options = {
-        method: 'GET',
-        headers: header,
-        muteHttpExceptions: true
-    };
+function generateSign(path, body, timestamp, token, platform, vName) {
+    let str = path + body + timestamp
+    const headerJson = `{"platform":"${platform}","timestamp":"${timestamp}","dId":"","vName":"${vName}"}`
+    str += headerJson
 
-    const response = UrlFetchApp.fetch(URLS.refresh, options);
-    const json = JSON.parse(response.getContentText());
-
-    if (json.code === 0 && json.data && json.data.token) {
-        return json.data.token;
-    } else {
-        // If code is not 0, the cred might be expired.
-        if (json.code !== 0) {
-            throw new Error(`Refresh Failed (Code: ${json.code}, Msg: ${json.message})`);
-        }
-        return null;
-    }
+    const hmacHex = createHmac("sha256", token).update(str).digest("hex")
+    const md5Hex = createHash("md5").update(hmacHex).digest("hex")
+    return md5Hex
 }
 
-/**
- * Main Check-in Function
- */
-function autoClaimFunction(profile) {
-    const { cred, token, skGameRole, platform, vName, accountName } = profile;
-    
-    // 1. Prepare Parameters
-    const timestamp = Math.floor(Date.now() / 1000).toString();
-    const path = "/web/v1/game/endfield/attendance"; 
-    const body = ""; 
-    
-    // 2. Generate Signature
-    const sign = generateSign(path, body, timestamp, token, platform, vName);
+async function refreshToken(profile) {
+    const { cred, platform, vName } = profile
+    const headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        Accept: "application/json, text/plain, */*",
+        cred,
+        platform,
+        vName,
+        Origin: "https://game.skport.com",
+        Referer: "https://game.skport.com/",
+    }
 
-    const header = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Content-Type': 'application/json',
-        'sk-language': 'en_US', // Changed to en_US for English response (if supported), or keep zh_Hant
-        'sk-game-role': skGameRole,
-        'cred': cred, 
-        'platform': platform,
-        'vName': vName,
-        'timestamp': timestamp,
-        'sign': sign, 
-        'Origin': 'https://game.skport.com',
-        'Referer': 'https://game.skport.com/'
-    };
+    const res = await fetch(URLS.refresh, { method: "GET", headers })
+    const text = await res.text()
+    let json = null
+    try {
+        json = JSON.parse(text)
+    } catch (e) {
+        throw new Error(`Invalid JSON from refresh: ${text}`)
+    }
 
-    const options = {
-        method: 'POST',
-        headers: header,
-        muteHttpExceptions: true,
-        payload: body
-    };
+    if (json.code === 0 && json.data && json.data.token) return json.data.token
+    throw new Error(`Refresh Failed (Code: ${json.code}, Msg: ${json.message || "no message"})`)
+}
 
-    let result = {
-        name: accountName,
-        success: false,
-        status: "",
-        rewards: ""
-    };
+async function autoClaimFunction(profile) {
+    const { cred, token, skGameRole, platform, vName, accountName } = profile
+    const timestamp = Math.floor(Date.now() / 1000).toString()
+    const path = "/web/v1/game/endfield/attendance"
+    const body = ""
+
+    const sign = generateSign(path, body, timestamp, token, platform, vName)
+
+    const headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        Accept: "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "sk-language": "en_US",
+        "sk-game-role": skGameRole,
+        cred,
+        platform,
+        vName,
+        timestamp,
+        sign,
+        Origin: "https://game.skport.com",
+        Referer: "https://game.skport.com/",
+    }
+
+    const result = { name: accountName, success: false, status: "", rewards: "" }
 
     try {
-        const response = UrlFetchApp.fetch(URLS.attendance, options);
-        const json = JSON.parse(response.getContentText());
-
-        console.log(`[${accountName}] API Response: ${JSON.stringify(json, null, 2)}`);
-        
-        if (json.code === 0) {
-            result.success = true;
-            result.status = `Check-in Successful. ${json.message || ''}`;
-            
-            if (json.data && json.data.awardIds) {
-                const awards = json.data.awardIds.map(award => {
-                    const resource = json.data.resourceInfoMap ? json.data.resourceInfoMap[award.id] : null;
-                    return resource ? `${resource.name} x${resource.count}` : (award.id || "Unknown Item");
-                }).join('\n');
-                result.rewards = awards;
-            } else {
-                result.rewards = "No detailed reward info.";
-            }
-
-        } else if (json.code === 10001) {
-            result.success = true;
-            result.status = `Already Checked In. ${json.message || ''}`;
-            result.rewards = "Nothing to claim";
-        } else {
-            result.success = false;
-            result.status = `Error (Code: ${json.code})`;
-            result.rewards = json.message || "Unknown Error";
+        const res = await fetch(URLS.attendance, { method: "POST", headers, body })
+        const text = await res.text()
+        let json = null
+        try {
+            json = JSON.parse(text)
+        } catch (e) {
+            throw new Error(`Invalid JSON from attendance: ${text}`)
         }
-    } catch (error) {
-        result.success = false;
-        result.status = "💥 Exception";
-        result.rewards = error.message;
-        console.error(error);
+
+        console.log(`[${accountName}] API Response: ${JSON.stringify(json, null, 2)}`)
+
+        if (json.code === 0) {
+            result.success = true
+            result.status = `Check-in Successful. ${json.message || ""}`
+            if (json.data && json.data.awardIds) {
+                const awards = (json.data.awardIds || [])
+                    .map((award) => {
+                        const resource = json.data.resourceInfoMap ? json.data.resourceInfoMap[award.id] : null
+                        return resource ? `${resource.name} x${resource.count}` : award.id || "Unknown Item"
+                    })
+                    .join("\n")
+                result.rewards = awards || "None"
+            } else {
+                result.rewards = "No detailed reward info."
+            }
+        } else if (json.code === 10001) {
+            result.success = true
+            result.status = `Already Checked In. ${json.message || ""}`
+            result.rewards = "Nothing to claim"
+        } else {
+            result.success = false
+            result.status = `Error (Code: ${json.code})`
+            result.rewards = json.message || "Unknown Error"
+        }
+    } catch (err) {
+        result.success = false
+        result.status = "💥 Exception"
+        result.rewards = err.message
+        console.error(err)
     }
 
-    return result;
+    return result
 }
 
-/**
- * Endfield Signature Algorithm (HMAC-SHA256 -> MD5)
- */
-function generateSign(path, body, timestamp, token, platform, vName) {
-    let str = path + body + timestamp;
-    const headerJson = `{"platform":"${platform}","timestamp":"${timestamp}","dId":"","vName":"${vName}"}`;
-    str += headerJson;
-    
-    // Sign using the token obtained from refresh
-    const hmacBytes = Utilities.computeHmacSha256Signature(str, token);
-    const hmacHex = bytesToHex(hmacBytes);
-    
-    const md5Bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, hmacHex);
-    return bytesToHex(md5Bytes);
-}
+async function sendDiscordEmbed(results) {
+    if (!ENABLE_DISCORD_NOTIFY || !DISCORD_WEBHOOK_URL) return
 
-/**
- * Helper: Convert Byte Array to Hex String
- */
-function bytesToHex(bytes) {
-    return bytes.map(function(byte) {
-        return ('0' + (byte & 0xFF).toString(16)).slice(-2);
-    }).join('');
-}
+    const allSuccess = results.every((r) => r.success)
+    const embedColor = allSuccess ? 5763719 : 15548997
 
-/**
- * Send Report to Discord
- */
-function sendDiscordEmbed(results) {
-    const allSuccess = results.every(r => r.success);
-    const hasError = !allSuccess;
-    const embedColor = allSuccess ? 5763719 : 15548997;
-    
-    const fields = results.map(r => {
-        return {
-            name: r.name,
-            value: `**Status:** ${r.status}\n**Rewards:**\n${r.rewards ? r.rewards : 'None'}`,
-            inline: true
-        };
-    });
+    const fields = results.map((r) => ({ name: r.name, value: `**Status:** ${r.status}\n**Rewards:**\n${r.rewards || "None"}`, inline: true }))
 
     const payload = {
-        username: "Nielio | SKPort Auto Check In",
+        username: "SKPort Auto Check In",
         avatar_url: "https://i.imgur.com/ZC1qsD5.png",
-        embeds: [{
-            title: "Check-in completed!",
-            color: embedColor,
-            fields: fields,
-            footer: {
-                text: `Time: ${new Date().toLocaleString('en-US', { timeZone: 'UTC' })} (UTC)`,
-                icon_url: "https://assets.skport.com/assets/favicon.ico"
-            }
-        }]
-    };
-
-    if (hasError && DISCORD_USER_ID) {
-        payload.content = `<@${DISCORD_USER_ID}> Script encountered an error, please check logs!`;
+        embeds: [{ title: "Check-in completed!", color: embedColor, fields, footer: { text: `Time: ${new Date().toLocaleString("en-US", { timeZone: "UTC" })} (UTC)` } }],
     }
 
-    const options = {
-        method: 'POST',
-        contentType: 'application/json',
-        payload: JSON.stringify(payload),
-        muteHttpExceptions: true
-    };
+    if (!allSuccess && DISCORD_USER_ID) payload.content = `<@${DISCORD_USER_ID}> Script encountered an error, please check logs!`
 
     try {
-        UrlFetchApp.fetch(DISCORD_WEBHOOK_URL, options);
-    } catch (e) {
-        console.error("Failed to send Discord webhook: " + e.message);
+        await fetch(DISCORD_WEBHOOK_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
+        console.log("Discord report sent")
+    } catch (err) {
+        console.error("Failed to send Discord webhook:", err.message)
     }
 }
+
+async function runOnce() {
+    console.log("Starting run...")
+    const results = []
+
+    for (let i = 0; i < profiles.length; i++) {
+        const profile = Object.assign({}, profiles[i])
+        console.log(`[${profile.accountName}] Working...`)
+        try {
+            profile.token = await refreshToken(profile)
+            console.log(`[${profile.accountName}] Token refreshed`)
+            const res = await autoClaimFunction(profile)
+            results.push(res)
+        } catch (err) {
+            console.error(`[${profile.accountName}] Error:`, err.message)
+            results.push({ name: profile.accountName || "Unknown", success: false, status: "Error", rewards: err.message })
+        }
+
+        await sleep(1000)
+    }
+
+    if (ENABLE_DISCORD_NOTIFY && DISCORD_WEBHOOK_URL) await sendDiscordEmbed(results)
+    console.log("Run complete")
+}
+
+// Orchestrate: run once at startup
+;(async () => {
+    await runOnce()
+    process.exit(0)
+})()
